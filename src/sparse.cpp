@@ -28,7 +28,7 @@ struct Edge{
 };
 
 struct metadata{
-    int src = -69;
+    int src = -1;
     int first_index = -1;
     int edge_count = 0;
 
@@ -126,7 +126,7 @@ int main(int argc, char** argv){
         world.cout("Got number of Edges: ", Edge_num);
     */
 
-    std::string uni_filename = "../data/1000x1000.csv";
+    std::string uni_filename = "../data/100x100.csv";
 
      // Task 1: data extraction
     ygm::container::bag<Edge> bag_A(world);
@@ -209,7 +209,6 @@ int main(int argc, char** argv){
 
     //world.cout0("bag size: ", bag_size);
     double abs_start = MPI_Wtime();
-    static std::vector<metadata> mat_metadata;
     ygm::container::array<Edge> matrix_A(world, bag_A);
     static ygm::container::array<Edge> &s_matrix_A = matrix_A;
     ygm::container::array<Edge> matrix_B(world, bag_B); // BOOKMARK: Sort matrix B later
@@ -238,74 +237,52 @@ int main(int argc, char** argv){
     /*
         Perhaps have each rank perform only calculation on their own before sending the data to rank 0 to save time
     */
-    static std::vector<metadata> local_metadata;
-    static std::vector<metadata> global_metadata;
-    int cur_pos = 0;
-    int respective_index = 0;
-    matrix_B.for_all([&cur_pos](int index, Edge &ed){
-        if(local_metadata.empty()){
-            local_metadata.push_back({ed.row, index, 1});
-        }
-        else if(local_metadata.at(cur_pos).src != ed.row){
-            local_metadata.push_back({ed.row, index, 1});
-            cur_pos++;
-        }
-        else{ // the row number matches
-            local_metadata.at(cur_pos).edge_count++;
-        }
+    /*
+        use distributed map with async_visit
+        (source/row number, key<index, edge_count)
+        if it does not exist, then set the index and increment 
+        if it does exist, then only increment the edge_count
+
+        use local unordered_map to store these metadata
+        use gather()
+    */
+    ygm::container::map<int, metadata> metadata_map(world);
+    static ygm::container::map<int, metadata> &s_metadata_map = metadata_map;
+    matrix_B.for_all([](int index, Edge &ed){
+
+        auto visitor = [](int source, metadata &mt, int index, Edge ed){
+            if(mt.edge_count == 0 || mt.first_index > index){ // uninitialized
+                mt.first_index = index;
+            }
+            mt.src = ed.row;
+            mt.edge_count++;
+        };
+
+        s_metadata_map.async_visit(ed.row, visitor, index, ed);
     });
     world.barrier();
-
-    ygm::container::bag<metadata> metadata_bag(world);
-    for(metadata md : local_metadata){
-        metadata_bag.async_insert(md);
-    }
     
+    static std::unordered_map<int, metadata> local_metadata;
+    metadata_map.gather(local_metadata);
     // potential race condition with std::vector
-    auto merger = [](std::vector<metadata> indiv_metadata){
-        // rank 0 may be sending the same local data to itself (if merging it into local_metadata)
-        global_metadata.insert(global_metadata.end(), indiv_metadata.begin(), indiv_metadata.end()); 
-    };
-    s_world.async(0, merger, local_metadata);
+    // auto merger = [](std::vector<metadata> indiv_metadata){
+    //     // rank 0 may be sending the same local data to itself (if merging it into local_metadata)
+    //     global_metadata.insert(global_metadata.end(), indiv_metadata.begin(), indiv_metadata.end()); 
+    // };
+    // s_world.async(0, merger, local_metadata);
+
+
     world.barrier();
 
     // if(world.rank0()){
-    //     for(auto &mt : global_metadata){
-    //         printf("source/row number: %d, first index: %d, edge count: %d\n", mt.src, mt.first_index, mt.edge_count);
+    //     for(auto &mt : local_metadata){
+    //         printf("source/row number: %d, first index: %d, edge count: %d\n", mt.first, mt.second.first_index, mt.second.edge_count);
     //     }
     // }
     // world.cout0("---------------------------------------");
-    if(world.rank0()){
-        std::sort(global_metadata.begin(), global_metadata.end());
-
-        // merge the same source information
-        int first_index = 0;
-        int current_src = -1; // assuming there is no source of -1
-        for(size_t i = 0; i < global_metadata.size(); ){
-            if(current_src == -1 || current_src != global_metadata.at(i).src){ 
-                current_src = global_metadata.at(i).src;
-                first_index = i;
-                i++; // only move onto the next element if we did not erase an element
-            }
-            else if(current_src == global_metadata.at(i).src){
-                global_metadata.at(first_index).edge_count += global_metadata.at(i).edge_count;
-                global_metadata.erase(global_metadata.begin() + i);
-            }
-        }
-        s_world.async_bcast([](std::vector<metadata> sorted_metadata){
-            global_metadata = sorted_metadata;
-        }, global_metadata);
-    }
-    world.barrier();
+   
     double metadata_time = MPI_Wtime();
     world.cout0("Completed creating metadata vector in ", metadata_time - abs_start, " seconds");
-
-    // if(world.rank() == 1){
-    //     for(auto &mt : global_metadata){
-    //         printf("source/row number: %d, first index: %d, edge count: %d\n", mt.src, mt.first_index, mt.edge_count);
-    //     }
-    // }
-        
 
     /*
         Task 3: matrix C data structure
@@ -335,24 +312,24 @@ int main(int argc, char** argv){
     double SpGEMM_start = MPI_Wtime();
     matrix_A.for_all([](int index, Edge &ed){
         int column_A = ed.col; // need a matching row (source)
-        // but what if there is no matching row?
         int row_A = ed.row;
         int value_A = ed.value;
-        int rowB_index = -1;
-        if((rowB_index = getIndex(column_A, global_metadata, 0)) != -1){ // found a matching row in matrix A
-            int src = global_metadata.at(rowB_index).src;
-            int src_edge_count = global_metadata.at(rowB_index).edge_count;
-            int start_index = global_metadata.at(rowB_index).first_index;
+        if(local_metadata.find(column_A) != local_metadata.end()){ // found a matching row in matrix A
+            auto mt = local_metadata.find(column_A);
+            int src = mt->first;
+            int src_edge_count = mt->second.edge_count;
+            int start_index = mt->second.first_index;
 
-            auto multiplier = [&column_A](int index, Edge &ed, int value_A, int row_A){
+            auto multiplier = [](int index, Edge &ed, int value_A, int row_A, int column_A){
                 int partial_product = value_A * ed.value; // valueB * valueA;
-                // printf("From matrix A(%d, %d) value %d, ", row_A, column_A ,value_A);
-                // printf("From matrix B(%d, %d) value %d, ", ed.row, ed.col ,ed.value);
-                // printf("Got partial product: %d\n", partial_product);
+                if(column_A != ed.row){
+                    printf("From matrix A(%d, %d) value %d, ", row_A, column_A ,value_A);
+                    printf("From matrix B(%d, %d) value %d, ", ed.row, ed.col ,ed.value);
+                    printf("Got partial product: %d\n", partial_product);
+                }
                 
                 /*
                     Task 5: Storing the partial products
-
                     1. How to store partial products?
                         a. create a linked list off the same key
                         b. use mapped_reduce() if the key already exists (overwriting)
@@ -364,11 +341,8 @@ int main(int argc, char** argv){
                 s_matrix_C.async_visit(std::make_pair(row_A, ed.col), adder, partial_product); // Boost's hasher complains if I use a struct
             };           
             for(int i = 0; i < src_edge_count; i++){
-                if(start_index + i >= mat_B_size){
-                    cout << "src: " << src << ", edge_count: " << src_edge_count << endl;
-                    return;
-                }
-                s_matrix_B.async_visit(start_index + i, multiplier, value_A, row_A); // async_visit_if_contains does not work??
+                YGM_ASSERT_RELEASE(start_index + i < mat_B_size);
+                s_matrix_B.async_visit(start_index + i, multiplier, value_A, row_A, column_A); // async_visit_if_contains does not work??
             }
         }
     });
@@ -388,34 +362,17 @@ int main(int argc, char** argv){
     world.barrier();
 
     std::vector<Edge> sorted_output_C;
-    //size_t bag_size_C = global_bag_C.size();
-    //world.cout0("bag size: ", bag_size_C);
-
-    global_bag_C.for_all([&sorted_output_C](Edge &ed){
-        sorted_output_C.push_back(ed);
-    });
-    world.barrier();
-
-    {
-        auto merger = [&sorted_output_C](std::vector<Edge> indiv_vector){
-            // rank 0 may be sending the same local data to itself (if merging it into local_metadata)
-            sorted_output_C.insert(sorted_output_C.end(), indiv_vector.begin(), indiv_vector.end()); 
-        };
-        s_world.async(0, merger, sorted_output_C);
-
+    global_bag_C.gather(sorted_output_C, 0);
+    if(world.rank0()){
+        std::sort(sorted_output_C.begin(), sorted_output_C.end());
+        for(Edge &ed : sorted_output_C){
+            printf("%d, %d, %d\n", ed.row, ed.col, ed.value);
+        }
     }
-    world.barrier();
     
 
-    // if(world.rank0()){
-    //     std::sort(sorted_output_C.begin(), sorted_output_C.end());
-    //     for(Edge &ed : sorted_output_C){
-    //         printf("%d, %d, %d\n", ed.row, ed.col, ed.value);
-    //     }
-    // }
 
-
-
+    world.barrier();
     return 0;
 }
 
