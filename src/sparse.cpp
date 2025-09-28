@@ -126,7 +126,9 @@ int main(int argc, char** argv){
         world.cout("Got number of Edges: ", Edge_num);
     */
 
-    std::string uni_filename = "../data/100x100.csv";
+    #define UNDIRECTED_GRAPH
+
+    std::string uni_filename = "../data/facebook_combined.csv";
 
      // Task 1: data extraction
     ygm::container::bag<Edge> bag_A(world);
@@ -143,8 +145,10 @@ int main(int argc, char** argv){
         if(line.size() == 3){
            value = line[2].as_integer();
         }
-        // long long vertex_one = std::min(vertex_a, vertex_b);
-        // long long vertex_two = std::max(vertex_a, vertex_b);
+        #ifdef UNDIRECTED_GRAPH
+            Edge rev = {col, row, value};
+            bag_A.async_insert(rev);
+        #endif
         Edge ed = {row, col, value};
         bag_A.async_insert(ed);
     });
@@ -162,11 +166,13 @@ int main(int argc, char** argv){
         int row = line[0].as_integer();
         int col = line[1].as_integer();
         int value = 1;
-        // long long vertex_one = std::min(vertex_a, vertex_b);
-        // long long vertex_two = std::max(vertex_a, vertex_b);
         if(line.size() == 3){
             value = line[2].as_integer();
         }
+        #ifdef UNDIRECTED_GRAPH
+            Edge rev = {col, row, value};
+            bag_B.async_insert(rev);
+        #endif
         Edge ed = {row, col, value};
         bag_B.async_insert(ed);
     });
@@ -351,9 +357,11 @@ int main(int argc, char** argv){
     world.cout0("SpGEMM calculation took ", abs_end - SpGEMM_start, " seconds");
     world.cout0("Extraction + Sorting + Metadata + Matrix Multiplication ", abs_end - abs_start, " seconds");
 
-    // matrix_C.for_all([](std::pair<int, int> pair, int product){
-    //     printf("%d, %d, %d\n", pair.first, pair.second, product);
-    // });
+    //#define MATRIX_OUTPUT
+    #ifdef MATRIX_OUTPUT
+    matrix_C.for_all([](std::pair<int, int> pair, int product){
+        printf("%d, %d, %d\n", pair.first, pair.second, product);
+    });
 
     ygm::container::bag<Edge> global_bag_C(world);
     matrix_C.for_all([&global_bag_C](std::pair<int, int> coord, int product){
@@ -369,10 +377,84 @@ int main(int argc, char** argv){
             printf("%d, %d, %d\n", ed.row, ed.col, ed.value);
         }
     }
+    #endif
     
-
-
+    #define TRIANGLE_COUNTING
+    #ifdef TRIANGLE_COUNTING
+    ygm::container::bag<Edge> bag_C(world);
+    matrix_C.for_all([&bag_C](std::pair<int, int> indices, int value){
+        bag_C.async_insert({indices.first, indices.second, value});
+    });
     world.barrier();
+    ygm::container::array<Edge> arr_matrix_C(world, bag_C);  // <row, col>, partial product 
+    static ygm::container::array<Edge> &s_arr_matrix_C = arr_matrix_C;
+
+    ygm::container::map<std::pair<int, int>, int> diagonal_matrix(world);  //
+    static ygm::container::map<std::pair<int, int>, int> &s_diagonal_matrix = diagonal_matrix;
+
+
+    arr_matrix_C.for_all([](int index, Edge &ed){
+        int column_C = ed.col; // need a matching row (source)
+        int row_C = ed.row;
+        int value_C = ed.value;
+        if(local_metadata.find(column_C) != local_metadata.end()){ // found a matching row in matrix A
+            auto mt = local_metadata.find(column_C);
+            int src = mt->first;
+            int src_edge_count = mt->second.edge_count;
+            int start_index = mt->second.first_index;
+
+            auto multiplier = [](int index, Edge &ed, int value_C, int row_C, int column_C){
+
+                auto adder = [](std::pair<int, int> coord, int &accum, int value_add){
+                    // don't forget that for weighted graph, you need to only add one for triangle counting
+                    accum += value_add;
+                };
+                // we are only concerned about the diagonal, thus the row of matrix C and column of matrix B must match
+                if(row_C == ed.col){
+                    int partial_product = value_C * ed.value; // valueB * valueA;
+                    YGM_ASSERT_RELEASE(column_C == ed.row);
+                    
+                    /*
+                        Task 5: Storing the partial products
+                        1. How to store partial products?
+                            a. create a linked list off the same key
+                            b. use mapped_reduce() if the key already exists (overwriting)
+                    */
+                   
+                    // race condition?
+                    //s_diagonal_matrix.async_insert({row_C, ed.col}, 0);
+                    s_diagonal_matrix.async_visit(std::make_pair(row_C, ed.col), adder, partial_product); // Boost's hasher complains if I use a struct
+                }
+                
+            };           
+            for(int i = 0; i < src_edge_count; i++){
+                YGM_ASSERT_RELEASE(start_index + i < mat_B_size);
+                s_matrix_B.async_visit(start_index + i, multiplier, value_C, row_C, column_C); // async_visit_if_contains does not work??
+            }
+        }
+    });
+    world.barrier();
+
+    int triangle_count = 0;
+    int global_triangle_count = 0;
+    diagonal_matrix.for_all([&triangle_count](std::pair<int, int> indices, int value){
+        if(indices.first == indices.second){
+            triangle_count += value;
+        }
+    });
+    world.barrier();
+
+    auto adder = [&global_triangle_count](int value){
+        global_triangle_count += value;
+    };
+    world.async(0, adder, triangle_count);
+    world.barrier();
+    if(world.rank0()){
+        s_world.cout0("triangle count: ", global_triangle_count / 6);
+    }
+    #endif
+
+
     return 0;
 }
 
