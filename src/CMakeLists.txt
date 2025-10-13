@@ -3,4 +3,4 @@
 #
 # SPDX-License-Identifier: MIT
 
-add_ygm_executable(sparse)
+add_ygm_executable(test_sparse)

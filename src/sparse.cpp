@@ -126,9 +126,9 @@ int main(int argc, char** argv){
         world.cout("Got number of Edges: ", Edge_num);
     */
 
-    #define UNDIRECTED_GRAPH
+    //#define UNDIRECTED_GRAPH
 
-    std::string uni_filename = "../data/facebook_combined.csv";
+    std::string uni_filename = "../data/1000x1000.csv";
 
      // Task 1: data extraction
     ygm::container::bag<Edge> bag_A(world);
@@ -215,13 +215,15 @@ int main(int argc, char** argv){
 
     //world.cout0("bag size: ", bag_size);
     double abs_start = MPI_Wtime();
+    YGM_ASSERT_RELEASE(bag_A.size() != 0);
+    YGM_ASSERT_RELEASE(bag_B.size() != 0);
     ygm::container::array<Edge> matrix_A(world, bag_A);
     static ygm::container::array<Edge> &s_matrix_A = matrix_A;
     ygm::container::array<Edge> matrix_B(world, bag_B); // BOOKMARK: Sort matrix B later
     static ygm::container::array<Edge> &s_matrix_B = matrix_B;
     // deallocate bag_A and bag_B
     world.barrier();
-    matrix_B.sort(); // Globally sort matrix A
+    matrix_B.sort(); // Globally sort matrix B
     bag_A.clear(); // deallocates majority.
     bag_B.clear();
     double ext_end = MPI_Wtime(); 
@@ -252,6 +254,70 @@ int main(int argc, char** argv){
         use local unordered_map to store these metadata
         use gather()
     */
+
+    // matrix_B.for_all([](int index, Edge &ed){
+    //     s_world.cout(ed.row, ", ", ed.col, ", ", ed.value);
+    // });
+
+
+    /*
+        index = rank number
+        pair<minimum row number, maximum row number> the rank holds
+        get the minimum and maximum row number that each processor holds
+
+        to gather/merge, you can either use:
+            1. a distributed data structure, then call gather on it
+            2. use rank 0's local data structure, call async to rank 0, 
+                insert the data into index that matches the caller rank's id.
+                Then rank 0 broadcasts to all other ranks
+    */
+    int num_of_processors = world.size();
+    std::vector<std::pair<int, int>> metadata(num_of_processors);
+
+    int local_size = matrix_B.local_size();
+    int local_min = -1;
+    int local_max = -1;
+    auto minSetter = [&local_min](int index, Edge &ed){
+        local_min = ed.row;
+    };
+    auto maxSetter = [&local_max](int index, Edge &ed){
+        local_max = ed.row;
+    };
+    // local_start() global index of the rank's first local element
+    // local_visit() expects a global index, used when that global index belongs to the called rank
+    if(local_size != 0){
+        matrix_B.local_visit(matrix_B.partitioner.local_start(), minSetter);
+        matrix_B.local_visit(matrix_B.partitioner.local_start() + local_size - 1, maxSetter);
+    }
+    world.barrier();
+
+    auto mt_inserter = [&metadata](int rank_num, std::pair<int, int> min_max){
+        //printf("Inserting local min %d and local max %d at index %d\n", min_max.first, min_max.second, rank_num);
+        metadata.at(rank_num) = min_max;
+    };
+    // gather does NOT work on ygm::array
+    world.async(0, mt_inserter, world.rank(), std::make_pair(local_min, local_max));
+    world.barrier();
+
+    // now broadcast it to all other ranks
+    auto broadcastMetadata = [&metadata](std::vector<std::pair<int, int>> incoming_metadata){
+        metadata = incoming_metadata;
+    };
+    if(world.rank0()){
+        world.async_bcast(broadcastMetadata, metadata);
+    }
+    world.barrier();
+    
+    if(world.rank() == 1){
+        for(int i = 0; i < metadata.size(); i++){
+            printf("rank %d: local min %d, local max %d\n", i, metadata.at(i).first, metadata.at(i).second);
+        }
+    }
+
+    //world.cout(world.rank(), ": minimum row number = ", local_min, ", maximum row number, = ", local_max);
+
+    //#define MAP_IMP
+    #ifdef MAP_IMP
     ygm::container::map<int, metadata> metadata_map(world);
     static ygm::container::map<int, metadata> &s_metadata_map = metadata_map;
     matrix_B.for_all([](int index, Edge &ed){
@@ -270,6 +336,7 @@ int main(int argc, char** argv){
     
     static std::unordered_map<int, metadata> local_metadata;
     metadata_map.gather(local_metadata);
+    #endif
     // potential race condition with std::vector
     // auto merger = [](std::vector<metadata> indiv_metadata){
     //     // rank 0 may be sending the same local data to itself (if merging it into local_metadata)
@@ -287,6 +354,7 @@ int main(int argc, char** argv){
     // }
     // world.cout0("---------------------------------------");
    
+    #if 0
     double metadata_time = MPI_Wtime();
     world.cout0("Completed creating metadata vector in ", metadata_time - abs_start, " seconds");
 
@@ -381,18 +449,21 @@ int main(int argc, char** argv){
     
     #define TRIANGLE_COUNTING
     #ifdef TRIANGLE_COUNTING
+    double bag_C_start = MPI_Wtime();
     ygm::container::bag<Edge> bag_C(world);
     matrix_C.for_all([&bag_C](std::pair<int, int> indices, int value){
         bag_C.async_insert({indices.first, indices.second, value});
     });
     world.barrier();
+    double bag_C_end = MPI_Wtime();
+    world.cout0("Constructing bag C from map matrix C took ", bag_C_end - bag_C_start, " seconds");
     ygm::container::array<Edge> arr_matrix_C(world, bag_C);  // <row, col>, partial product 
     static ygm::container::array<Edge> &s_arr_matrix_C = arr_matrix_C;
 
     ygm::container::map<std::pair<int, int>, int> diagonal_matrix(world);  //
     static ygm::container::map<std::pair<int, int>, int> &s_diagonal_matrix = diagonal_matrix;
 
-
+    double triangle_count_start = MPI_Wtime();
     arr_matrix_C.for_all([](int index, Edge &ed){
         int column_C = ed.col; // need a matching row (source)
         int row_C = ed.row;
@@ -449,9 +520,14 @@ int main(int argc, char** argv){
     };
     world.async(0, adder, triangle_count);
     world.barrier();
+
+    double triangle_count_end = MPI_Wtime();
+    world.cout0("Triangle counting and convergence took ", triangle_count_end - triangle_count_start, " seconds");
     if(world.rank0()){
         s_world.cout0("triangle count: ", global_triangle_count / 6);
     }
+    #endif
+
     #endif
 
 
