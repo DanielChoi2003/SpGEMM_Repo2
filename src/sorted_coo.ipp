@@ -13,7 +13,7 @@ inline vector<int> Sorted_COO::getOwners(int source){
                                 return min_max.second < src;
                             });
 
-    while(it != metadata.end() && (it->first == source || it->second == source)){ 
+    while(it != metadata.end() && (it->first <= source && it->second >= source)){ 
         int owner_rank = it - metadata.begin();
         owners.push_back(owner_rank);
         it++;
@@ -24,9 +24,67 @@ inline vector<int> Sorted_COO::getOwners(int source){
 
 inline void Sorted_COO::async_visit_row(int input_column, int input_row, int input_value, ygm::container::map<map_index, int> &matrix_C){
     
-    // find the owners of the matching row / source number.
+    auto multiplier = [this, &matrix_C](int input_value, int input_row, int input_column){
+        // find the first Edge with matching row to input_column with std::lower_bound
+        int low = sorted_matrix.partitioner.local_start();
+        int local_size  = sorted_matrix.local_size();
+        int high = low + local_size;
+        int upper_bound = high;
 
+        while (low < high) {
+            int mid = low + (high - low) / 2;
+            Edge mid_edge;
+            sorted_matrix.local_visit(mid, [&](int index, Edge& ed){ mid_edge = ed; });
 
+            if (mid_edge.row < input_column) { // the edge with matching row has to be to the right of mid
+                low = mid + 1;
+            }
+            else { // the first edge with matching row has to be to the left of mid
+                high = mid;
+            }
+        }
+
+        // keep multiplying with the next Edge until the row number no longer matches
+        for(int i = low; i < upper_bound; i++){
+            Edge match_edge;
+            sorted_matrix.local_visit(i, [&](int index, Edge& ed){ match_edge = ed; });
+            if(match_edge.row != input_column){
+                break;
+            }
+            int partial_product = input_value * match_edge.value; // valueB * valueA;
+            
+            // if(input_row == 5){
+            //     world.cout("Inserting position row ", input_row, ", column ", match_edge.col, " with value ", partial_product);
+            // }   
+            matrix_C.async_insert({input_row, match_edge.col}, 0);
+            auto adder = [](std::pair<int, int> coord, int &partial_product, int value_add){
+                partial_product += value_add;
+            };
+            matrix_C.async_visit(std::make_pair(input_row, match_edge.col), adder, partial_product); // Boost's hasher complains if I use a struct
+        }
+    }; 
+
+    vector<int> owners = getOwners(input_column);
+    for(int owner_rank : owners){
+        // if(owner_rank == 0 && input_column == 1){
+        //     world.cout("calling with row ", input_row, " and col ", input_column);
+        // }
+        world.async(owner_rank, multiplier, input_value, input_row, input_column); // async_visit_if_contains does not work??
+    }
+    
+    //DO NOT CALL BARRIER HERE. PROCESSOR NEEDS TO BE ABLE TO RUN MULTIPLE TIMES.
+}
+
+template <class Matrix, class Accumulator>
+inline void Sorted_COO::spgemm(Matrix &unsorted_matrix, Accumulator &partial_accum){
+
+    unsorted_matrix.local_for_all([&](int index, Edge &ed){
+        int input_column = ed.col;
+        int input_row = ed.row;
+        int input_value = ed.value;
+        //world.cout("Input column: ", input_column, ", input row: ", input_row, ", input_value: ", input_value);
+        async_visit_row(input_column, input_row, input_value, partial_accum);
+    });
 }
 
 inline void Sorted_COO::printMetadata(){
@@ -34,4 +92,6 @@ inline void Sorted_COO::printMetadata(){
         world.cout("rank ", i, ": local min " , metadata.at(i).first, ", local max ", metadata.at(i).second);
     }
 }
+
+
 

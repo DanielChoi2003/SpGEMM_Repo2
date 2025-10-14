@@ -43,8 +43,7 @@ public:
         @param ygm::container::bag<Edge>& src: where partial products are stored.
     */
     explicit Sorted_COO(ygm::comm& c, ygm::container::bag<Edge>& src): world(c), 
-                                                                        sorted_matrix(world, src), 
-                                                                        unsorted_matrix(world, src) {
+                                                                        sorted_matrix(world, src) {
         sorted_matrix.sort();
         /*
             index = rank number
@@ -142,7 +141,7 @@ public:
         @param Accumulator C: distributed map that stores the partial products
     */
     template <class Matrix, class Accumulator>
-    void spgemm(const Matrix &matrix_A, const Accumulator &C);
+    void spgemm(Matrix &matrix_A, Accumulator &partial_accum);
 
 
 private:
@@ -153,7 +152,6 @@ private:
 
     ygm::comm &world;                            // store the communicator. Hence the &
     ygm::container::array<Edge> sorted_matrix;  // store the sorted matrix
-    ygm::container::array<Edge> unsorted_matrix; // store the unsorted matrix
 };
 
 
@@ -165,7 +163,10 @@ private:
     1. Doesn't the class require two matrices to perform matrix multiplication?
 
     2. When using lambda function, does captured variable always refer to the callee's or caller's?
+        Answer:
+            Assuming that & uses the caller's memory address
 
-    3. undefined reference to sorted_coo.ipp. How to fix?
+    3. undefined reference to sorted_coo.ipp. 
+        Solution: adding inline to defined functions and adding #include "sorted_coo.ipp" at the end of "sorted_coo.hpp"
 
 */

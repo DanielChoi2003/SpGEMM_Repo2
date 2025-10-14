@@ -7,9 +7,9 @@ int main(int argc, char** argv){
     ygm::comm world(&argc, &argv);
     static ygm::comm &s_world = world;
     
-    //#define UNDIRECTED_GRAPH
+    #define UNDIRECTED_GRAPH
 
-    std::string uni_filename = "../data/1000x1000.csv";
+    std::string uni_filename = "../data/facebook_combined.csv";
 
      // Task 1: data extraction
     ygm::container::bag<Edge> bag_A(world);
@@ -59,18 +59,95 @@ int main(int argc, char** argv){
     });
     world.barrier();
 
-
+    ygm::container::array<Edge> unsorted_matrix(world, bag_B);
     Sorted_COO test_COO(world, bag_B);
 
-   // test_COO.printMetadata();
+    
+    // if(world.rank0()){
+    //     test_COO.printMetadata();  
+    // }
 
-    int source = 250;
+    // int source = 1;
+    // if(world.rank0()){
+    //     std::vector<int> owners = test_COO.getOwners(source);
+    //     for(int owner_rank : owners){
+    //         world.cout("Owner ", owner_rank, " owns ", source);
+    //     }
+    // }
+    ygm::container::map<std::pair<int, int>, int> matrix_C(world); 
+    test_COO.spgemm(unsorted_matrix, matrix_C);
+
+    world.barrier();
+    //#define MATRIX_OUTPUT
+    #ifdef MATRIX_OUTPUT
+    // matrix_C.for_all([](std::pair<int, int> pair, int product){
+    //     printf("%d, %d, %d\n", pair.first, pair.second, product);
+    // });
+
+    ygm::container::bag<Edge> global_bag_C(world);
+    matrix_C.for_all([&global_bag_C](std::pair<int, int> coord, int product){
+        global_bag_C.async_insert({coord.first, coord.second, product});
+    });
+    world.barrier();
+
+    std::vector<Edge> sorted_output_C;
+    global_bag_C.gather(sorted_output_C, 0);
     if(world.rank0()){
-        std::vector<int> owners = test_COO.getOwners(source);
-        for(int owner_rank : owners){
-            world.cout("Owner ", owner_rank, " owns ", source);
+        std::sort(sorted_output_C.begin(), sorted_output_C.end());
+        for(Edge &ed : sorted_output_C){
+            printf("%d, %d, %d\n", ed.row, ed.col, ed.value);
         }
     }
+    #endif
+
+
+    #define TRIANGLE_COUNTING
+    #ifdef TRIANGLE_COUNTING
+    double bag_C_start = MPI_Wtime();
+    ygm::container::bag<Edge> bag_C(world);
+    matrix_C.for_all([&bag_C](std::pair<int, int> indices, int value){
+        bag_C.async_insert({indices.first, indices.second, value});
+    });
+    world.barrier();
+    double bag_C_end = MPI_Wtime();
+    world.cout0("Constructing bag C from map matrix C took ", bag_C_end - bag_C_start, " seconds");
+    ygm::container::array<Edge> arr_matrix_C(world, bag_C);  // <row, col>, partial product 
+
+    ygm::container::map<std::pair<int, int>, int> diagonal_matrix(world);  //
+
+    double triangle_count_start = MPI_Wtime();
+    test_COO.spgemm(arr_matrix_C, diagonal_matrix);
+    world.barrier();
+
+    diagonal_matrix.for_all([](std::pair<int, int> pair, int product){
+        if(pair.first == pair.second){
+            printf("%d, %d, %d\n", pair.first, pair.second, product);
+
+        }
+    });
+
+    int triangle_count = 0;
+    int global_triangle_count = 0;
+    diagonal_matrix.for_all([&triangle_count](std::pair<int, int> indices, int value){
+        if(indices.first == indices.second){
+            triangle_count += value;
+        }
+    });
+    world.barrier();
+
+    auto adder = [&global_triangle_count](int value){
+        global_triangle_count += value;
+    };
+    world.async(0, adder, triangle_count);
+    world.barrier();
+
+    double triangle_count_end = MPI_Wtime();
+    world.cout0("Triangle counting and convergence took ", triangle_count_end - triangle_count_start, " seconds");
+    if(world.rank0()){
+        s_world.cout0("triangle count: ", global_triangle_count / 6);
+    }
+    #endif
+
    
 
     return 0;
