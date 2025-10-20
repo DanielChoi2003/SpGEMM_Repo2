@@ -22,10 +22,17 @@ inline vector<int> Sorted_COO::getOwners(int source){
     return owners;
 }
 
+
 inline void Sorted_COO::async_visit_row(int input_column, int input_row, int input_value, ygm::container::map<map_index, int> &matrix_C){
     
+    /*
+        NOTE: CAPTURING THE DISTRIBUTED CONTAINER BY REFERENCE MAY LEAD TO UNDEFINED BEHAVIOR 
+            because the distributed container may not be in the same memory address from the remote rank (callee)'s 
+            memory layout
+    */
+   
     auto multiplier = [this, &matrix_C](int input_value, int input_row, int input_column){
-        // find the first Edge with matching row to input_column with std::lower_bound
+         // find the first Edge with matching row to input_column with std::lower_bound
         int low = sorted_matrix.partitioner.local_start();
         int local_size  = sorted_matrix.local_size();
         int high = low + local_size;
@@ -46,11 +53,12 @@ inline void Sorted_COO::async_visit_row(int input_column, int input_row, int inp
 
         // keep multiplying with the next Edge until the row number no longer matches
         for(int i = low; i < upper_bound; i++){
-            Edge match_edge;
+            Edge match_edge;  
             sorted_matrix.local_visit(i, [&](int index, Edge& ed){ match_edge = ed; });
             if(match_edge.row != input_column){
                 break;
             }
+
             int partial_product = input_value * match_edge.value; // valueB * valueA;
             
             // if(input_row == 5){
@@ -63,6 +71,7 @@ inline void Sorted_COO::async_visit_row(int input_column, int input_row, int inp
             matrix_C.async_visit(std::make_pair(input_row, match_edge.col), adder, partial_product); // Boost's hasher complains if I use a struct
         }
     }; 
+    
 
     vector<int> owners = getOwners(input_column);
     for(int owner_rank : owners){

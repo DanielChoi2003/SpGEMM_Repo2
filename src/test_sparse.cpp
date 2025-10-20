@@ -1,5 +1,7 @@
 #include "sorted_coo.hpp"
 #include <ygm/io/csv_parser.hpp>
+#include <stdio.h>
+#include <mpi.h>
 
 
 int main(int argc, char** argv){
@@ -62,18 +64,27 @@ int main(int argc, char** argv){
     ygm::container::array<Edge> unsorted_matrix(world, bag_B);
     Sorted_COO test_COO(world, bag_B);
 
-    
-    // if(world.rank0()){
-    //     test_COO.printMetadata();  
-    // }
 
-    // int source = 1;
-    // if(world.rank0()){
-    //     std::vector<int> owners = test_COO.getOwners(source);
-    //     for(int owner_rank : owners){
-    //         world.cout("Owner ", owner_rank, " owns ", source);
-    //     }
-    // }
+    int rank, size;
+    char processor_name[MPI_MAX_PROCESSOR_NAME];
+    int namelen;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Get_processor_name(processor_name, &namelen);
+
+    printf("Hello from process %d of %d on node %s\n", rank, size, processor_name);
+    
+    if(world.rank0()){
+        test_COO.printMetadata();  
+    }
+
+    int source = 1;
+    if(world.rank0()){
+        std::vector<int> owners = test_COO.getOwners(source);
+        for(int owner_rank : owners){
+            world.cout("Owner ", owner_rank, " owns ", source);
+        }
+    }
     ygm::container::map<std::pair<int, int>, int> matrix_C(world); 
     test_COO.spgemm(unsorted_matrix, matrix_C);
 
@@ -101,7 +112,7 @@ int main(int argc, char** argv){
     #endif
 
 
-    #define TRIANGLE_COUNTING
+    //#define TRIANGLE_COUNTING
     #ifdef TRIANGLE_COUNTING
     double bag_C_start = MPI_Wtime();
     ygm::container::bag<Edge> bag_C(world);
@@ -119,12 +130,11 @@ int main(int argc, char** argv){
     test_COO.spgemm(arr_matrix_C, diagonal_matrix);
     world.barrier();
 
-    diagonal_matrix.for_all([](std::pair<int, int> pair, int product){
-        if(pair.first == pair.second){
-            printf("%d, %d, %d\n", pair.first, pair.second, product);
-
-        }
-    });
+    // diagonal_matrix.for_all([](std::pair<int, int> pair, int product){
+    //     if(pair.first == pair.second){
+    //         printf("%d, %d, %d\n", pair.first, pair.second, product);
+    //     }
+    // });
 
     int triangle_count = 0;
     int global_triangle_count = 0;

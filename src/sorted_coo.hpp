@@ -94,6 +94,22 @@ public:
         world.barrier(); 
     }
 
+    // template <typename YGMContainer>
+    //     map(ygm::comm&          comm,
+    //         const YGMContainer& yc) requires detail::HasForAll<YGMContainer> &&
+    //         detail::SingleItemTuple<typename YGMContainer::for_all_args>
+    //         : m_comm(comm), pthis(this), partitioner(comm), m_default_value() {
+    //         m_comm.log(log_level::info, "Creating ygm::container::map");
+    //         pthis.check(m_comm);
+
+    //         yc.for_all([this](const std::pair<Key, Value>& value) {
+    //         this->async_insert(value);
+    //         });
+
+    //         m_comm.barrier();
+    //     }
+
+
     /*
         @brief 
             prints each rank's metadata vector. A test case function to ensure that 
@@ -110,7 +126,6 @@ public:
     */
     std::vector<int> getOwners(int source);
    
-
     /*
         @brief
             finds the set of owners (ranks) that contains elements with the matching row number.
@@ -152,6 +167,7 @@ private:
 
     ygm::comm &world;                            // store the communicator. Hence the &
     ygm::container::array<Edge> sorted_matrix;  // store the sorted matrix
+
 };
 
 
@@ -160,13 +176,19 @@ private:
 
 
 /*
-    1. Doesn't the class require two matrices to perform matrix multiplication?
+    1. would having another YGM container in the class lead to too much overhead? Does it create an entirely new copy
+        or use the local data to create a partial copy. Cannot determine the behavior of multiple ranks calling the same
+        constructor function.
 
     2. When using lambda function, does captured variable always refer to the callee's or caller's?
         Answer:
             Assuming that & uses the caller's memory address
 
-    3. undefined reference to sorted_coo.ipp. 
+    3. 
+    
+    
+    
+    undefined reference to sorted_coo.ipp. 
         Solution: adding inline to defined functions and adding #include "sorted_coo.ipp" at the end of "sorted_coo.hpp"
 
 */
