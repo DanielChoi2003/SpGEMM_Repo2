@@ -13,7 +13,6 @@
 
 using map_index = std::pair<int, int>;
 
-
 struct Edge{
     int row;
     int col;
@@ -37,14 +36,14 @@ class Sorted_COO{
 public:
 
     /*
-        @brief
-            Initializes the ygm::container::array member with a ygm::container::bag provided by the user.
-        @param ygm::comm& c: ommunicator object
-        @param ygm::container::bag<Edge>& src: where partial products are stored.
+        @brief Initializes the ygm::container::array member with a ygm::container::bag provided by the user.
+
+        @param ygm::comm&: communicator object
+        @param ygm::container::array<Edge>& src: already sorted array
     */
-    explicit Sorted_COO(ygm::comm& c, ygm::container::bag<Edge>& src): world(c), 
-                                                                        sorted_matrix(world, src) {
-        sorted_matrix.sort();
+    explicit Sorted_COO(ygm::comm& c, ygm::container::array<Edge>& src): world(c), pthis(this) {
+
+        pthis.check(world);
         /*
             index = rank number
             pair<minimum row number, maximum row number> the rank holds
@@ -56,41 +55,39 @@ public:
                 insert the data into index that matches the caller rank's id.
                 Then rank 0 broadcasts to all other ranks
         */
+       // does comm::size() implicitly call barrier()?
+       // array.size() contains a barrier()
         int num_of_processors = world.size();
         metadata.resize(num_of_processors);
 
-        int local_size = sorted_matrix.local_size();
-        int local_min = -1;
-        int local_max = -1;
-        auto minSetter = [&local_min](int index, Edge &ed){
-            local_min = ed.row;
-        };
-        auto maxSetter = [&local_max](int index, Edge &ed){
-            local_max = ed.row;
-        };
-        // local_start() global index of the rank's first local element
-        // local_visit() expects a global index, used when that global index belongs to the called rank
-        if(local_size != 0){
-            sorted_matrix.local_visit(sorted_matrix.partitioner.local_start(), minSetter);
-            sorted_matrix.local_visit(sorted_matrix.partitioner.local_start() + local_size - 1, maxSetter);
-        }
-        world.barrier();
+        src.local_for_all([this](int index, Edge ed){
+            lc_sorted_matrix.push_back(ed);
+        });
 
-        auto mt_inserter = [this](int rank_num, std::pair<int, int> min_max){
+        global_start = src.partitioner.local_start();
+        global_end = global_start + src.local_size();
+        local_min = lc_sorted_matrix.front().row;
+        local_max = lc_sorted_matrix.back().row;
+
+        //printf("rank %d: local min %d, local max %d\n", world.rank(), local_min, local_max);
+        auto mt_inserter = [](int rank_num, std::pair<int, int> min_max, auto pCoo){
             //printf("Inserting local min %d and local max %d at index %d\n", min_max.first, min_max.second, rank_num);
-            this->metadata.at(rank_num) = min_max;
+            pCoo->metadata.at(rank_num) = min_max;
         };
-        // gather does NOT work on ygm::array
-        world.async(0, mt_inserter, world.rank(), std::make_pair(local_min, local_max));
+        // gather does NOT work on ygm::array. does work on map
+        world.async(0, mt_inserter, world.rank(), std::make_pair(local_min, local_max), pthis);
         world.barrier();
 
-        // now broadcast it to all other ranks
-        auto broadcastMetadata = [this](std::vector<std::pair<int, int>> incoming_metadata){
-            this->metadata = incoming_metadata;
+        //now broadcast it to all other ranks
+        auto broadcastMetadata = [this](std::vector<std::pair<int, int>> incoming_metadata, auto pCOO){
+            pCOO->metadata = incoming_metadata;
         };
+
         if(world.rank0()){
-            world.async_bcast(broadcastMetadata, metadata);
+            world.async_bcast(broadcastMetadata, metadata, pthis);
         }
+
+
         world.barrier(); 
     }
 
@@ -125,6 +122,11 @@ public:
         @param source: the number of the row number 
     */
     std::vector<int> getOwners(int source);
+
+    /*
+        prints all elements of the sorted matrix
+    */
+   void printAll();
    
     /*
         @brief
@@ -143,7 +145,7 @@ public:
 
         @return none
     */
-    void async_visit_row(int input_column, int input_row, int input_value, ygm::container::map<map_index, int> &matrix_C);
+    void async_visit_row(int input_column, int input_row, int input_value, auto pmap);
 
 
     /*
@@ -156,7 +158,7 @@ public:
         @param Accumulator C: distributed map that stores the partial products
     */
     template <class Matrix, class Accumulator>
-    void spgemm(Matrix &matrix_A, Accumulator &partial_accum);
+    void spGemm(Matrix &matrix_A, Accumulator &partial_accum);
 
 
 private:
@@ -165,9 +167,13 @@ private:
     */
     std::vector<std::pair<int, int>> metadata;
 
+    int global_start = -1;
+    int global_end = -1;
+    int local_min = -1;
+    int local_max = -1;
     ygm::comm &world;                            // store the communicator. Hence the &
-    ygm::container::array<Edge> sorted_matrix;  // store the sorted matrix
-
+    std::vector<Edge> lc_sorted_matrix;  // store the local sorted matrix
+    typename ygm::ygm_ptr<Sorted_COO> pthis;
 };
 
 
@@ -184,7 +190,9 @@ private:
         Answer:
             Assuming that & uses the caller's memory address
 
-    3. 
+    3. using "this" pointer leads to segmentation fault.
+        Theory is that the memory address contained in "this" pointer may be different from the callee's "this" pointer's memory
+        address, thus leading to segmentation fault.
     
     
     

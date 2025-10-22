@@ -23,25 +23,22 @@ inline vector<int> Sorted_COO::getOwners(int source){
 }
 
 
-inline void Sorted_COO::async_visit_row(int input_column, int input_row, int input_value, ygm::container::map<map_index, int> &matrix_C){
+inline void Sorted_COO::async_visit_row(int input_column, int input_row, int input_value, auto pmap){
     
-    /*
-        NOTE: CAPTURING THE DISTRIBUTED CONTAINER BY REFERENCE MAY LEAD TO UNDEFINED BEHAVIOR 
-            because the distributed container may not be in the same memory address from the remote rank (callee)'s 
-            memory layout
-    */
-   
-    auto multiplier = [this, &matrix_C](int input_value, int input_row, int input_column){
+    
+        // NOTE: CAPTURING THE DISTRIBUTED CONTAINER BY REFERENCE MAY LEAD TO UNDEFINED BEHAVIOR 
+        //     because the distributed container may not be in the same memory address from the remote rank (callee)'s 
+        //     memory layout
+    
+    auto multiplier = [](int input_value, int input_row, int input_column, auto pCOO, auto pmap){
          // find the first Edge with matching row to input_column with std::lower_bound
-        int low = sorted_matrix.partitioner.local_start();
-        int local_size  = sorted_matrix.local_size();
-        int high = low + local_size;
+        int low = pCOO->global_start;
+        int high = pCOO->global_end;
         int upper_bound = high;
 
         while (low < high) {
             int mid = low + (high - low) / 2;
-            Edge mid_edge;
-            sorted_matrix.local_visit(mid, [&](int index, Edge& ed){ mid_edge = ed; });
+            Edge mid_edge = pCOO->lc_sorted_matrix.at(mid - pCOO->global_start);
 
             if (mid_edge.row < input_column) { // the edge with matching row has to be to the right of mid
                 low = mid + 1;
@@ -53,8 +50,7 @@ inline void Sorted_COO::async_visit_row(int input_column, int input_row, int inp
 
         // keep multiplying with the next Edge until the row number no longer matches
         for(int i = low; i < upper_bound; i++){
-            Edge match_edge;  
-            sorted_matrix.local_visit(i, [&](int index, Edge& ed){ match_edge = ed; });
+            Edge match_edge = pCOO->lc_sorted_matrix.at(i - pCOO->global_start);  
             if(match_edge.row != input_column){
                 break;
             }
@@ -64,35 +60,44 @@ inline void Sorted_COO::async_visit_row(int input_column, int input_row, int inp
             // if(input_row == 5){
             //     world.cout("Inserting position row ", input_row, ", column ", match_edge.col, " with value ", partial_product);
             // }   
-            matrix_C.async_insert({input_row, match_edge.col}, 0);
+            pmap->async_insert({input_row, match_edge.col}, 0);
             auto adder = [](std::pair<int, int> coord, int &partial_product, int value_add){
                 partial_product += value_add;
             };
-            matrix_C.async_visit(std::make_pair(input_row, match_edge.col), adder, partial_product); // Boost's hasher complains if I use a struct
+            pmap->async_visit(std::make_pair(input_row, match_edge.col), adder, partial_product); // Boost's hasher complains if I use a struct
         }
     }; 
-    
 
+    auto testing = [](auto pCOO){
+        pCOO->world.cout("hello from ", pCOO->world.rank());
+    };
+    
     vector<int> owners = getOwners(input_column);
     for(int owner_rank : owners){
         // if(owner_rank == 0 && input_column == 1){
         //     world.cout("calling with row ", input_row, " and col ", input_column);
         // }
-        world.async(owner_rank, multiplier, input_value, input_row, input_column); // async_visit_if_contains does not work??
+        assert(owner_rank >= 0 && owner_rank < world.size());
+        world.async(owner_rank, multiplier, input_value, input_row, input_column, pthis, pmap); // async_visit_if_contains does not work??
+        //world.async(owner_rank, testing, pthis);
     }
     
     //DO NOT CALL BARRIER HERE. PROCESSOR NEEDS TO BE ABLE TO RUN MULTIPLE TIMES.
 }
 
-template <class Matrix, class Accumulator>
-inline void Sorted_COO::spgemm(Matrix &unsorted_matrix, Accumulator &partial_accum){
 
+
+
+template <class Matrix, class Accumulator>
+inline void Sorted_COO::spGemm(Matrix &unsorted_matrix, Accumulator &partial_accum){
+
+    ygm::ygm_ptr<Accumulator> pmap(&partial_accum);
     unsorted_matrix.local_for_all([&](int index, Edge &ed){
         int input_column = ed.col;
         int input_row = ed.row;
         int input_value = ed.value;
         //world.cout("Input column: ", input_column, ", input row: ", input_row, ", input_value: ", input_value);
-        async_visit_row(input_column, input_row, input_value, partial_accum);
+        async_visit_row(input_column, input_row, input_value, pmap);
     });
 }
 
