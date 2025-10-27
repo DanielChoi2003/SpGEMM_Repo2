@@ -39,10 +39,11 @@ public:
         @brief Initializes the ygm::container::array member with a ygm::container::bag provided by the user.
 
         @param ygm::comm&: communicator object
-        @param ygm::container::array<Edge>& src: already sorted array
+        @param ygm::container::array<Edge>& src: array that will be sorted in the constructor.
     */
     explicit Sorted_COO(ygm::comm& c, ygm::container::array<Edge>& src): world(c), pthis(this) {
 
+        src.sort();
         pthis.check(world);
         /*
             index = rank number
@@ -64,8 +65,7 @@ public:
             lc_sorted_matrix.push_back(ed);
         });
 
-        global_start = src.partitioner.local_start();
-        global_end = global_start + src.local_size();
+        local_size = src.local_size();
         local_min = lc_sorted_matrix.front().row;
         local_max = lc_sorted_matrix.back().row;
 
@@ -145,7 +145,8 @@ public:
 
         @return none
     */
-    void async_visit_row(int input_column, int input_row, int input_value, auto pmap);
+    template<typename F>
+    void async_visit_row(int input_column, int input_row, int input_value, auto pmap, F user_func);
 
 
     /*
@@ -167,8 +168,7 @@ private:
     */
     std::vector<std::pair<int, int>> metadata;
 
-    int global_start = -1;
-    int global_end = -1;
+    int local_size = -1;
     int local_min = -1;
     int local_max = -1;
     ygm::comm &world;                            // store the communicator. Hence the &

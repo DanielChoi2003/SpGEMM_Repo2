@@ -22,23 +22,15 @@ inline vector<int> Sorted_COO::getOwners(int source){
     return owners;
 }
 
-
-inline void Sorted_COO::async_visit_row(int input_column, int input_row, int input_value, auto pmap){
-    
-    
-        // NOTE: CAPTURING THE DISTRIBUTED CONTAINER BY REFERENCE MAY LEAD TO UNDEFINED BEHAVIOR 
-        //     because the distributed container may not be in the same memory address from the remote rank (callee)'s 
-        //     memory layout
-    
-    auto multiplier = [](int input_value, int input_row, int input_column, auto pCOO, auto pmap){
+auto multiplier = [](int input_value, int input_row, int input_column, auto pCOO, auto pmap){
          // find the first Edge with matching row to input_column with std::lower_bound
-        int low = pCOO->global_start;
-        int high = pCOO->global_end;
+        int low = 0;
+        int high = pCOO->local_size;
         int upper_bound = high;
 
         while (low < high) {
             int mid = low + (high - low) / 2;
-            Edge mid_edge = pCOO->lc_sorted_matrix.at(mid - pCOO->global_start);
+            Edge mid_edge = pCOO->lc_sorted_matrix.at(mid);
 
             if (mid_edge.row < input_column) { // the edge with matching row has to be to the right of mid
                 low = mid + 1;
@@ -50,7 +42,7 @@ inline void Sorted_COO::async_visit_row(int input_column, int input_row, int inp
 
         // keep multiplying with the next Edge until the row number no longer matches
         for(int i = low; i < upper_bound; i++){
-            Edge match_edge = pCOO->lc_sorted_matrix.at(i - pCOO->global_start);  
+            Edge match_edge = pCOO->lc_sorted_matrix.at(i);  
             if(match_edge.row != input_column){
                 break;
             }
@@ -68,9 +60,11 @@ inline void Sorted_COO::async_visit_row(int input_column, int input_row, int inp
         }
     }; 
 
-    auto testing = [](auto pCOO){
-        pCOO->world.cout("hello from ", pCOO->world.rank());
-    };
+
+inline void Sorted_COO::async_visit_row(int input_column, int input_row, int input_value, auto pmap, F user_func){
+        // NOTE: CAPTURING THE DISTRIBUTED CONTAINER BY REFERENCE MAY LEAD TO UNDEFINED BEHAVIOR 
+        //     because the distributed container may not be in the same memory address from the remote rank (callee)'s 
+        //     memory layout
     
     vector<int> owners = getOwners(input_column);
     for(int owner_rank : owners){
@@ -79,7 +73,6 @@ inline void Sorted_COO::async_visit_row(int input_column, int input_row, int inp
         // }
         assert(owner_rank >= 0 && owner_rank < world.size());
         world.async(owner_rank, multiplier, input_value, input_row, input_column, pthis, pmap); // async_visit_if_contains does not work??
-        //world.async(owner_rank, testing, pthis);
     }
     
     //DO NOT CALL BARRIER HERE. PROCESSOR NEEDS TO BE ABLE TO RUN MULTIPLE TIMES.
