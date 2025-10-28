@@ -145,8 +145,8 @@ public:
 
         @return none
     */
-    template<typename F>
-    void async_visit_row(int input_column, int input_row, int input_value, auto pmap, F user_func);
+    template<typename F, typename... VisitorArgs>
+    void async_visit_row(int target_row, F user_func, VisitorArgs&... args);
 
 
     /*

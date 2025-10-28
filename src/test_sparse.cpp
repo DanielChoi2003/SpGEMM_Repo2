@@ -11,7 +11,7 @@ int main(int argc, char** argv){
     
     #define UNDIRECTED_GRAPH
 
-    std::string uni_filename = "../data/com-amazon.ungraph.csv";
+    std::string uni_filename = "../data/facebook_combined.csv";
 
      // Task 1: data extraction
     auto bagap = std::make_unique<ygm::container::bag<Edge>>(world);
