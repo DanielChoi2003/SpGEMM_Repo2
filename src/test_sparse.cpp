@@ -9,9 +9,9 @@ int main(int argc, char** argv){
     ygm::comm world(&argc, &argv);
     static ygm::comm &s_world = world;
     
-    #define UNDIRECTED_GRAPH
+    //#define UNDIRECTED_GRAPH
 
-    std::string uni_filename = "../data/facebook_combined.csv";
+    std::string uni_filename = "../data/10x10.csv";
 
      // Task 1: data extraction
     auto bagap = std::make_unique<ygm::container::bag<Edge>>(world);
@@ -69,18 +69,25 @@ int main(int argc, char** argv){
 
     Sorted_COO test_COO(world, sorted_matrix);
     world.barrier();
+
+    if(world.rank0()){
+        // sorted_matrix.local_for_all([](int index, Edge &ed){
+        //     printf("rank 0 owns %d\n", ed.row);
+        // });
+        test_COO.print_row_owners();
+    }
     
     // if(world.rank0()){
-    //     test_COO.printMetadata();  
+    //     test_COO.print_metadata();  
     // }
 
-    // int source = 1;
-    // if(world.rank0()){
-    //     std::vector<int> owners = test_COO.getOwners(source);
-    //     for(int owner_rank : owners){
-    //         world.cout("Owner ", owner_rank, " owns ", source);
-    //     }
-    // }
+    int source = 1;
+    if(world.rank0()){
+        std::vector<int> owners = test_COO.get_owners(source);
+        for(int owner_rank : owners){
+            world.cout("Rank ", owner_rank, " owns row ", source);
+        }
+    }
     ygm::container::map<std::pair<int, int>, int> matrix_C(world); 
     test_COO.spGemm(unsorted_matrix, matrix_C);
 
@@ -110,7 +117,7 @@ int main(int argc, char** argv){
     #endif
 
 
-    #define TRIANGLE_COUNTING
+    //#define TRIANGLE_COUNTING
     #ifdef TRIANGLE_COUNTING
     double bag_C_start = MPI_Wtime();
     auto bagcp = std::make_unique<ygm::container::bag<Edge>>(world);

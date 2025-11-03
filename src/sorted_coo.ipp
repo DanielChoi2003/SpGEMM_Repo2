@@ -4,19 +4,18 @@ using std::vector;
 /*
     Member functions defined inside the class body are implicitly inline.
 */
-inline vector<int> Sorted_COO::getOwners(int source){
-    // binary search
-    vector<int> owners;
-    // finds the position of the first occurrence not less than (either equal or greater) the given value
-    auto it = std::lower_bound(metadata.begin(), metadata.end(), source, 
-                            [](const std::pair<int, int> min_max, int src){
-                                return min_max.second < src;
-                            });
+inline vector<int> Sorted_COO::get_owners(int source){
 
-    while(it != metadata.end() && (it->first <= source && it->second >= source)){ 
-        int owner_rank = it - metadata.begin();
-        owners.push_back(owner_rank);
-        it++;
+    vector<int> owners;
+    // if the target row number is out of bound, return empty
+    if(source < 0 || source > row_ptrs.size() - 2){
+        return owners; 
+    }
+    int start = row_ptrs[source]; 
+    int end = row_ptrs[source+1]; // exclusive
+    while(start < end){
+        owners.push_back(owner_ranks.at(start));
+        start++;
     }
 
     return owners;
@@ -35,11 +34,8 @@ inline void Sorted_COO::async_visit_row(
             std::invoke(user_func, args...);
         };
     
-    vector<int> owners = getOwners(target_row);
+    vector<int> owners = get_owners(target_row);
     for(int owner_rank : owners){
-        // if(owner_rank == 0 && input_column == 1){
-        //     world.cout("calling with row ", input_row, " and col ", input_column);
-        // }
         assert(owner_rank >= 0 && owner_rank < world.size());
         world.async(owner_rank, vlambda, args...);
     }
@@ -79,15 +75,10 @@ inline void Sorted_COO::spGemm(Matrix &unsorted_matrix, Accumulator &partial_acc
             }
 
             int partial_product = input_value * match_edge.value; // valueB * valueA;
-            
-            // if(input_row == 5){
-            //     world.cout("Inserting position row ", input_row, ", column ", match_edge.col, " with value ", partial_product);
-            // }   
-            pmap->async_insert({input_row, match_edge.col}, 0);
             auto adder = [](std::pair<int, int> coord, int &partial_product, int value_add){
                 partial_product += value_add;
             };
-            pmap->async_visit(std::make_pair(input_row, match_edge.col), adder, partial_product); // Boost's hasher complains if I use a struct
+            pmap->async_visit({input_row, match_edge.col}, adder, partial_product); // Boost's hasher complains if I use a struct
         }
     }; 
     ygm::ygm_ptr<Accumulator> pmap(&partial_accum);
@@ -95,16 +86,38 @@ inline void Sorted_COO::spGemm(Matrix &unsorted_matrix, Accumulator &partial_acc
         int input_column = ed.col;
         int input_row = ed.row;
         int input_value = ed.value;
-        //world.cout("Input column: ", input_column, ", input row: ", input_row, ", input_value: ", input_value);
         async_visit_row(input_column, multiplier, pthis, pmap, input_value, input_row, input_column);
     });
 }
 
-inline void Sorted_COO::printMetadata(){
+inline void Sorted_COO::print_metadata(){
     for(int i = 0; i < metadata.size(); i++){
         world.cout("rank ", i, ": local min " , metadata.at(i).first, ", local max ", metadata.at(i).second);
     }
 }
+
+inline void Sorted_COO::print_row_owners(){
+    for(int i = 0; i < row_ptrs.size() - 1; i++){
+        int start = row_ptrs[i]; 
+        int end = row_ptrs[i+1];
+        if(start == end){
+            continue;
+        }
+        printf("row %d is owned by rank ", i);
+
+        while(start < end){
+            int owner_rank = owner_ranks.at(start);
+            if(start + 1 == end){
+                printf("%d\n", owner_rank);
+            }
+            else{
+                printf("%d, ", owner_rank);
+            }
+            start++;
+        }
+    }
+}
+
 
 
 

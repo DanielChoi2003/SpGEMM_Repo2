@@ -3,6 +3,7 @@
 #include <ygm/comm.hpp>
 #include <ygm/container/map.hpp>
 #include <ygm/container/array.hpp>
+#include <ygm/container/counting_set.hpp>
 #include <ygm/io/csv_parser.hpp>
 #include <ygm/container/bag.hpp>
 #include <fstream>
@@ -44,6 +45,12 @@ public:
     explicit Sorted_COO(ygm::comm& c, ygm::container::array<Edge>& src): world(c), pthis(this) {
 
         src.sort();
+        // creation of a container requires all ranks to be present
+        /*
+            temporary set to keep track of nonzero rows.
+            To be used when checking middle row between min and max rows.
+        */
+        ygm::container::counting_set<int> nonzero_rows(world);
         pthis.check(world);
         /*
             index = rank number
@@ -61,7 +68,8 @@ public:
         int num_of_processors = world.size();
         metadata.resize(num_of_processors);
 
-        src.local_for_all([this](int index, Edge ed){
+        src.local_for_all([this, &nonzero_rows](int index, Edge ed){
+            nonzero_rows.async_insert(ed.row);
             lc_sorted_matrix.push_back(ed);
         });
 
@@ -74,7 +82,6 @@ public:
             //printf("Inserting local min %d and local max %d at index %d\n", min_max.first, min_max.second, rank_num);
             pCoo->metadata.at(rank_num) = min_max;
         };
-        // gather does NOT work on ygm::array. does work on map
         world.async(0, mt_inserter, world.rank(), std::make_pair(local_min, local_max), pthis);
         world.barrier();
 
@@ -86,47 +93,46 @@ public:
         if(world.rank0()){
             world.async_bcast(broadcastMetadata, metadata, pthis);
         }
-
-
         world.barrier(); 
+
+        // to see whether the current row has changed value
+        int previous_row = -1;
+        for(int i = 0; i < metadata.size(); i++){ // i is the owner rank
+            int current_row = metadata[i].first;
+            // problem: it includes empty row numbers
+            // example: 1 (nonzero row), 2, 3, 4, 5, 6 (nonzero row)
+            //          then it includes zero rows 2, 3, 4, 5
+            while(current_row <= metadata[i].second){
+                if(previous_row != current_row){
+                    row_ptrs.push_back(owner_ranks.size());
+                }
+                if(nonzero_rows.count(current_row) != 0){
+                    owner_ranks.push_back(i);
+                }
+                previous_row = current_row;
+                current_row++;
+            }
+        }
+        row_ptrs.push_back(owner_ranks.size());
+
     }
-
-    // template <typename YGMContainer>
-    //     map(ygm::comm&          comm,
-    //         const YGMContainer& yc) requires detail::HasForAll<YGMContainer> &&
-    //         detail::SingleItemTuple<typename YGMContainer::for_all_args>
-    //         : m_comm(comm), pthis(this), partitioner(comm), m_default_value() {
-    //         m_comm.log(log_level::info, "Creating ygm::container::map");
-    //         pthis.check(m_comm);
-
-    //         yc.for_all([this](const std::pair<Key, Value>& value) {
-    //         this->async_insert(value);
-    //         });
-
-    //         m_comm.barrier();
-    //     }
-
 
     /*
         @brief 
             prints each rank's metadata vector. A test case function to ensure that 
             each rank contains the same global data.
     */
-    void printMetadata();
+    void print_metadata();
 
-
+    void print_row_owners();
     /*
         @brief 
             gets the owners of the row number that matches to the given argument "source".
     
         @param source: the number of the row number 
     */
-    std::vector<int> getOwners(int source);
+    std::vector<int> get_owners(int source);
 
-    /*
-        prints all elements of the sorted matrix
-    */
-   void printAll();
    
     /*
         @brief
@@ -167,6 +173,13 @@ private:
         contains each processor's min and max source number (row number)
     */
     std::vector<std::pair<int, int>> metadata;
+    /*
+        CSR data structure for O(1) lookup
+    */
+    std::vector<int> owner_ranks;
+    std::vector<int> row_ptrs;
+    std::vector<int> nonzero_rows;
+
 
     int local_size = -1;
     int local_min = -1;
