@@ -11,15 +11,16 @@ int main(int argc, char** argv){
     
     //#define UNDIRECTED_GRAPH
 
-    std::string uni_filename = "../data/10x10.csv";
+    std::string filename_A = "../data/synthetic_data/A_matrix_57x102.csv";
+    std::string filename_B = "../data/synthetic_data/B_matrix_102x70.csv";
 
      // Task 1: data extraction
     auto bagap = std::make_unique<ygm::container::bag<Edge>>(world);
-    std::vector<std::string> filename_A = {uni_filename};
-    std::fstream file_A(filename_A[0]);
+    std::vector<std::string> files_A= {filename_A};
+    std::fstream file_A(files_A[0]);
     YGM_ASSERT_RELEASE(file_A.is_open() == true);
     file_A.close();
-    ygm::io::csv_parser parser_A(world, filename_A);
+    ygm::io::csv_parser parser_A(world, files_A);
     parser_A.for_all([&](ygm::io::detail::csv_line line){ // currently rank 0 is the only one running. is byte partition fixed?
 
         int row = line[0].as_integer();
@@ -37,16 +38,16 @@ int main(int argc, char** argv){
     });
     world.barrier();
 
-    ygm::container::array<Edge> sorted_matrix(world, *bagap);
+    ygm::container::array<Edge> unsorted_matrix(world, *bagap);
     bagap.reset();
 
     // matrix B data extraction
     auto bagbp = std::make_unique<ygm::container::bag<Edge>>(world);
-    std::vector<std::string> filename_B = {uni_filename};
-    std::fstream file_B(filename_B[0]);
+     std::vector<std::string> files_B= {filename_B};
+    std::fstream file_B(files_B[0]);
     YGM_ASSERT_RELEASE(file_B.is_open() == true);
     file_B.close();
-    ygm::io::csv_parser parser_B(world, filename_B);
+    ygm::io::csv_parser parser_B(world, files_B);
     parser_B.for_all([&](ygm::io::detail::csv_line line){
 
         int row = line[0].as_integer();
@@ -64,30 +65,28 @@ int main(int argc, char** argv){
     });
     world.barrier();
 
-    ygm::container::array<Edge> unsorted_matrix(world, *bagbp);
+    ygm::container::array<Edge> sorted_matrix(world, *bagbp);
     bagbp.reset();
 
     Sorted_COO test_COO(world, sorted_matrix);
     world.barrier();
 
-    if(world.rank0()){
-        // sorted_matrix.local_for_all([](int index, Edge &ed){
-        //     printf("rank 0 owns %d\n", ed.row);
-        // });
-        test_COO.print_row_owners();
-    }
-    
-    // if(world.rank0()){
-    //     test_COO.print_metadata();  
+    // if(world.rank() == 3){
+    //     test_COO.print_owner_ranks();  
+    // }
+    // if(world.rank() == 3){
+    //     test_COO.print_row_ptrs();
     // }
 
-    int source = 1;
-    if(world.rank0()){
-        std::vector<int> owners = test_COO.get_owners(source);
-        for(int owner_rank : owners){
-            world.cout("Rank ", owner_rank, " owns row ", source);
-        }
-    }
+    
+    // int source = 8;
+    // if(world.rank0()){
+    //     std::vector<int> owners = test_COO.get_owners(source);
+    //     for(int owner_rank : owners){
+    //         world.cout("Rank ", owner_rank, " owns row ", source);
+    //     }
+    // }
+
     ygm::container::map<std::pair<int, int>, int> matrix_C(world); 
     test_COO.spGemm(unsorted_matrix, matrix_C);
 
@@ -96,7 +95,7 @@ int main(int argc, char** argv){
     //     printf("%d, %d, %d\n", pair.first, pair.second, product);
     // });
 
-    //#define MATRIX_OUTPUT
+    #define MATRIX_OUTPUT
     #ifdef MATRIX_OUTPUT
    
 
@@ -111,7 +110,7 @@ int main(int argc, char** argv){
     if(world.rank0()){
         std::sort(sorted_output_C.begin(), sorted_output_C.end());
         for(Edge &ed : sorted_output_C){
-            printf("%d, %d, %d\n", ed.row, ed.col, ed.value);
+            printf("%d,%d,%d\n", ed.row, ed.col, ed.value);
         }
     }
     #endif

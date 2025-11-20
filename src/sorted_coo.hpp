@@ -74,15 +74,27 @@ public:
         });
 
         local_size = src.local_size();
-        local_min = lc_sorted_matrix.front().row;
-        local_max = lc_sorted_matrix.back().row;
+        //printf("rank %d has %d nonzero elements\n", world.rank(), local_size);
+        // it may have zero nnz elements
+        if(!lc_sorted_matrix.empty()){
+            local_min = lc_sorted_matrix.front().row;
+            local_max = lc_sorted_matrix.back().row;
+        }
+        else{
+            local_min = INT_MAX;
+            local_max = INT_MIN;
+        }
+        
 
         //printf("rank %d: local min %d, local max %d\n", world.rank(), local_min, local_max);
         auto mt_inserter = [](int rank_num, std::pair<int, int> min_max, auto pCoo){
             //printf("Inserting local min %d and local max %d at index %d\n", min_max.first, min_max.second, rank_num);
             pCoo->metadata.at(rank_num) = min_max;
         };
-        world.async(0, mt_inserter, world.rank(), std::make_pair(local_min, local_max), pthis);
+        // if local_min is greater than local_max (meaning the rank does not own any elements), then don't add it to metadata
+        if(local_min <= local_max){
+            world.async(0, mt_inserter, world.rank(), std::make_pair(local_min, local_max), pthis);
+        }
         world.barrier();
 
         //now broadcast it to all other ranks
@@ -95,13 +107,31 @@ public:
         }
         world.barrier(); 
 
-        // to see whether the current row has changed value
-        int previous_row = -1;
+        /*
+            problem: missing gaps (row number that is not owned by any rank and not between rank's min & max) will misalign
+                    the row_ptrs array.
+                    Also if the row number does not start with zero, it also gets misaligned by one index.
+        */
+        int global_min = metadata.empty() ? 0 : metadata.front().first;
+        // pad the row_ptrs array, so the first row number can access the correct owners (uses index as the row number)
+        for(int k = 0; k < global_min; k++){
+            row_ptrs.push_back(owner_ranks.size());
+        }
+        int previous_row = global_min - 1;
         for(int i = 0; i < metadata.size(); i++){ // i is the owner rank
             int current_row = metadata[i].first;
-            // problem: it includes empty row numbers
-            // example: 1 (nonzero row), 2, 3, 4, 5, 6 (nonzero row)
-            //          then it includes zero rows 2, 3, 4, 5
+
+            /*
+                fill gaps between previous rank's max row number
+                and the current rank's min row number.
+                ex: min max
+                0: [0, 3]
+                1: [6, 9]
+                missing row numbers: 4, 5
+            */ 
+            for(int j = previous_row + 1; j < current_row; j++){
+                row_ptrs.push_back(owner_ranks.size());
+            }
             while(current_row <= metadata[i].second){
                 if(previous_row != current_row){
                     row_ptrs.push_back(owner_ranks.size());
@@ -114,6 +144,8 @@ public:
             }
         }
         row_ptrs.push_back(owner_ranks.size());
+        // don't forget a barrier here since spgemm relies on these metadata.
+        world.barrier(); 
 
     }
 
@@ -125,6 +157,36 @@ public:
     void print_metadata();
 
     void print_row_owners();
+
+    void print_row_ptrs(){
+        printf("row_ptrs: ");
+        for(int i = 0; i < row_ptrs.size(); i++){
+            if(i == 0){
+                printf("[ %d, ", row_ptrs.at(i));
+            }
+            else if (i == row_ptrs.size() - 1){
+                printf("%d ]\n", row_ptrs.at(i));
+            }
+            else{
+                printf("%d, ", row_ptrs.at(i));
+            }
+        }
+    }
+
+    void print_owner_ranks(){
+        printf("owner_ranks: ");
+        for(int i = 0; i < owner_ranks.size(); i++){
+            if(i == 0){
+                printf("[ %d, ", owner_ranks.at(i));
+            }
+            else if (i == owner_ranks.size() - 1){
+                printf("%d ]\n", owner_ranks.at(i));
+            }
+            else{
+                printf("%d, ", owner_ranks.at(i));
+            }
+        }
+    }
     /*
         @brief 
             gets the owners of the row number that matches to the given argument "source".
@@ -151,8 +213,8 @@ public:
 
         @return none
     */
-    template<typename F, typename... VisitorArgs>
-    void async_visit_row(int target_row, F user_func, VisitorArgs&... args);
+    template<typename Fn, typename... VisitorArgs>
+    void async_visit_row(int target_row, Fn user_func, VisitorArgs&... args);
 
 
     /*

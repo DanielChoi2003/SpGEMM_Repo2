@@ -17,25 +17,25 @@ inline vector<int> Sorted_COO::get_owners(int source){
         owners.push_back(owner_ranks.at(start));
         start++;
     }
-
     return owners;
 }
 
-template<typename F, typename... VisitorArgs>
+template<typename Fn, typename... VisitorArgs>
 inline void Sorted_COO::async_visit_row(
                         int target_row, 
-                        F user_func, 
+                        Fn user_func, 
                         VisitorArgs&... args){
         // NOTE: CAPTURING THE DISTRIBUTED CONTAINER BY REFERENCE MAY LEAD TO UNDEFINED BEHAVIOR 
         //     because the distributed container may not be in the same memory address from the remote rank (callee)'s 
         //     memory layout
     auto vlambda = 
-        [user_func](const VisitorArgs&... args) mutable { // lambda are const by default; args are read-only
+        [user_func](const VisitorArgs... args) mutable { // lambda are const by default; args are read-only
             std::invoke(user_func, args...);
         };
     
     vector<int> owners = get_owners(target_row);
     for(int owner_rank : owners){
+        //printf("Row %d is owned by rank %d\n", target_row, owner_rank);
         assert(owner_rank >= 0 && owner_rank < world.size());
         world.async(owner_rank, vlambda, args...);
     }
@@ -57,7 +57,7 @@ inline void Sorted_COO::spGemm(Matrix &unsorted_matrix, Accumulator &partial_acc
 
         while (low < high) {
             int mid = low + (high - low) / 2;
-            Edge mid_edge = self->lc_sorted_matrix.at(mid);
+            const Edge &mid_edge = self->lc_sorted_matrix[mid];
 
             if (mid_edge.row < input_column) { // the edge with matching row has to be to the right of mid
                 low = mid + 1;
@@ -69,16 +69,20 @@ inline void Sorted_COO::spGemm(Matrix &unsorted_matrix, Accumulator &partial_acc
 
         // keep multiplying with the next Edge until the row number no longer matches
         for(int i = low; i < upper_bound; i++){
-            Edge match_edge = self->lc_sorted_matrix.at(i);  
+            const Edge &match_edge = self->lc_sorted_matrix.at(i);  
             if(match_edge.row != input_column){
                 break;
             }
 
-            int partial_product = input_value * match_edge.value; // valueB * valueA;
-            auto adder = [](std::pair<int, int> coord, int &partial_product, int value_add){
+            // NOTE: could potentially overflow with large values
+            int product = input_value * match_edge.value; // valueB * valueA;
+            if(product == 0){
+                continue;
+            }
+            auto adder = [](const std::pair<int, int> &coord, int &partial_product, int value_add){
                 partial_product += value_add;
             };
-            pmap->async_visit({input_row, match_edge.col}, adder, partial_product); // Boost's hasher complains if I use a struct
+            pmap->async_visit({input_row, match_edge.col}, adder, product); // Boost's hasher complains if I use a struct
         }
     }; 
     ygm::ygm_ptr<Accumulator> pmap(&partial_accum);
