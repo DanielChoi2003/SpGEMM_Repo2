@@ -11,8 +11,8 @@ int main(int argc, char** argv){
     
     //#define UNDIRECTED_GRAPH
 
-    std::string filename_A = "../data/synthetic_data/A_matrix_57x102.csv";
-    std::string filename_B = "../data/synthetic_data/B_matrix_102x70.csv";
+    std::string filename_A = "../data/real_data/directed/soc-Epinions1.csv";
+    std::string filename_B = "../data/real_data/directed/soc-Epinions1.csv";
 
      // Task 1: data extraction
     auto bagap = std::make_unique<ygm::container::bag<Edge>>(world);

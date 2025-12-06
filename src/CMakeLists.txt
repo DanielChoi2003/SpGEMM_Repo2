@@ -4,3 +4,4 @@
 # SPDX-License-Identifier: MIT
 
 add_ygm_executable(test_sparse)
+add_ygm_executable(shared_mem others/shared_mem.cpp)
