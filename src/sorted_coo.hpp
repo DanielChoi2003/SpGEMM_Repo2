@@ -3,6 +3,7 @@
 #include <ygm/comm.hpp>
 #include <ygm/container/map.hpp>
 #include <ygm/container/array.hpp>
+#include <ygm/container/counting_set.hpp>
 #include <ygm/io/csv_parser.hpp>
 #include <ygm/container/bag.hpp>
 #include <fstream>
@@ -12,7 +13,6 @@
 #include <vector>
 
 using map_index = std::pair<int, int>;
-
 
 struct Edge{
     int row;
@@ -37,14 +37,21 @@ class Sorted_COO{
 public:
 
     /*
-        @brief
-            Initializes the ygm::container::array member with a ygm::container::bag provided by the user.
-        @param ygm::comm& c: ommunicator object
-        @param ygm::container::bag<Edge>& src: where partial products are stored.
+        @brief Initializes the ygm::container::array member with a ygm::container::bag provided by the user.
+
+        @param ygm::comm&: communicator object
+        @param ygm::container::array<Edge>& src: array that will be sorted in the constructor.
     */
-    explicit Sorted_COO(ygm::comm& c, ygm::container::bag<Edge>& src): world(c), 
-                                                                        sorted_matrix(world, src) {
-        sorted_matrix.sort();
+    explicit Sorted_COO(ygm::comm& c, ygm::container::array<Edge>& src): world(c), pthis(this) {
+
+        src.sort();
+        // creation of a container requires all ranks to be present
+        /*
+            temporary set to keep track of nonzero rows.
+            To be used when checking middle row between min and max rows.
+        */
+        ygm::container::counting_set<int> nonzero_rows(world);
+        pthis.check(world);
         /*
             index = rank number
             pair<minimum row number, maximum row number> the rank holds
@@ -56,75 +63,138 @@ public:
                 insert the data into index that matches the caller rank's id.
                 Then rank 0 broadcasts to all other ranks
         */
+       // does comm::size() implicitly call barrier()?
+       // array.size() contains a barrier()
         int num_of_processors = world.size();
         metadata.resize(num_of_processors);
 
-        int local_size = sorted_matrix.local_size();
-        int local_min = -1;
-        int local_max = -1;
-        auto minSetter = [&local_min](int index, Edge &ed){
-            local_min = ed.row;
+        src.local_for_all([this, &nonzero_rows](int index, Edge ed){
+            nonzero_rows.async_insert(ed.row);
+            lc_sorted_matrix.push_back(ed);
+        });
+
+        local_size = src.local_size();
+        //printf("rank %d has %d nonzero elements\n", world.rank(), local_size);
+        // it may have zero nnz elements
+        if(!lc_sorted_matrix.empty()){
+            local_min = lc_sorted_matrix.front().row;
+            local_max = lc_sorted_matrix.back().row;
+        }
+        else{
+            local_min = INT_MAX;
+            local_max = INT_MIN;
+        }
+        
+
+        //printf("rank %d: local min %d, local max %d\n", world.rank(), local_min, local_max);
+        auto mt_inserter = [](int rank_num, std::pair<int, int> min_max, auto pCoo){
+            //printf("Inserting local min %d and local max %d at index %d\n", min_max.first, min_max.second, rank_num);
+            pCoo->metadata.at(rank_num) = min_max;
         };
-        auto maxSetter = [&local_max](int index, Edge &ed){
-            local_max = ed.row;
-        };
-        // local_start() global index of the rank's first local element
-        // local_visit() expects a global index, used when that global index belongs to the called rank
-        if(local_size != 0){
-            sorted_matrix.local_visit(sorted_matrix.partitioner.local_start(), minSetter);
-            sorted_matrix.local_visit(sorted_matrix.partitioner.local_start() + local_size - 1, maxSetter);
+        // if local_min is greater than local_max (meaning the rank does not own any elements), then don't add it to metadata
+        if(local_min <= local_max){
+            world.async(0, mt_inserter, world.rank(), std::make_pair(local_min, local_max), pthis);
         }
         world.barrier();
 
-        auto mt_inserter = [this](int rank_num, std::pair<int, int> min_max){
-            //printf("Inserting local min %d and local max %d at index %d\n", min_max.first, min_max.second, rank_num);
-            this->metadata.at(rank_num) = min_max;
+        //now broadcast it to all other ranks
+        auto broadcastMetadata = [this](std::vector<std::pair<int, int>> incoming_metadata, auto pCOO){
+            pCOO->metadata = incoming_metadata;
         };
-        // gather does NOT work on ygm::array
-        world.async(0, mt_inserter, world.rank(), std::make_pair(local_min, local_max));
-        world.barrier();
 
-        // now broadcast it to all other ranks
-        auto broadcastMetadata = [this](std::vector<std::pair<int, int>> incoming_metadata){
-            this->metadata = incoming_metadata;
-        };
         if(world.rank0()){
-            world.async_bcast(broadcastMetadata, metadata);
+            world.async_bcast(broadcastMetadata, metadata, pthis);
         }
         world.barrier(); 
+
+        /*
+            problem: missing gaps (row number that is not owned by any rank and not between rank's min & max) will misalign
+                    the row_ptrs array.
+                    Also if the row number does not start with zero, it also gets misaligned by one index.
+        */
+        int global_min = metadata.empty() ? 0 : metadata.front().first;
+        // pad the row_ptrs array, so the first row number can access the correct owners (uses index as the row number)
+        for(int k = 0; k < global_min; k++){
+            row_ptrs.push_back(owner_ranks.size());
+        }
+        int previous_row = global_min - 1;
+        for(int i = 0; i < metadata.size(); i++){ // i is the owner rank
+            int current_row = metadata[i].first;
+
+            /*
+                fill gaps between previous rank's max row number
+                and the current rank's min row number.
+                ex: min max
+                0: [0, 3]
+                1: [6, 9]
+                missing row numbers: 4, 5
+            */ 
+            for(int j = previous_row + 1; j < current_row; j++){
+                row_ptrs.push_back(owner_ranks.size());
+            }
+            while(current_row <= metadata[i].second){
+                if(previous_row != current_row){
+                    row_ptrs.push_back(owner_ranks.size());
+                }
+                if(nonzero_rows.count(current_row) != 0){
+                    owner_ranks.push_back(i);
+                }
+                previous_row = current_row;
+                current_row++;
+            }
+        }
+        row_ptrs.push_back(owner_ranks.size());
+        // don't forget a barrier here since spgemm relies on these metadata.
+        world.barrier(); 
+
     }
-
-    // template <typename YGMContainer>
-    //     map(ygm::comm&          comm,
-    //         const YGMContainer& yc) requires detail::HasForAll<YGMContainer> &&
-    //         detail::SingleItemTuple<typename YGMContainer::for_all_args>
-    //         : m_comm(comm), pthis(this), partitioner(comm), m_default_value() {
-    //         m_comm.log(log_level::info, "Creating ygm::container::map");
-    //         pthis.check(m_comm);
-
-    //         yc.for_all([this](const std::pair<Key, Value>& value) {
-    //         this->async_insert(value);
-    //         });
-
-    //         m_comm.barrier();
-    //     }
-
 
     /*
         @brief 
             prints each rank's metadata vector. A test case function to ensure that 
             each rank contains the same global data.
     */
-    void printMetadata();
+    void print_metadata();
 
+    void print_row_owners();
 
+    void print_row_ptrs(){
+        printf("row_ptrs: ");
+        for(int i = 0; i < row_ptrs.size(); i++){
+            if(i == 0){
+                printf("[ %d, ", row_ptrs.at(i));
+            }
+            else if (i == row_ptrs.size() - 1){
+                printf("%d ]\n", row_ptrs.at(i));
+            }
+            else{
+                printf("%d, ", row_ptrs.at(i));
+            }
+        }
+    }
+
+    void print_owner_ranks(){
+        printf("owner_ranks: ");
+        for(int i = 0; i < owner_ranks.size(); i++){
+            if(i == 0){
+                printf("[ %d, ", owner_ranks.at(i));
+            }
+            else if (i == owner_ranks.size() - 1){
+                printf("%d ]\n", owner_ranks.at(i));
+            }
+            else{
+                printf("%d, ", owner_ranks.at(i));
+            }
+        }
+    }
     /*
         @brief 
             gets the owners of the row number that matches to the given argument "source".
     
         @param source: the number of the row number 
     */
-    std::vector<int> getOwners(int source);
+    std::vector<int> get_owners(int source);
+
    
     /*
         @brief
@@ -143,7 +213,8 @@ public:
 
         @return none
     */
-    void async_visit_row(int input_column, int input_row, int input_value, ygm::container::map<map_index, int> &matrix_C);
+    template<typename Fn, typename... VisitorArgs>
+    void async_visit_row(int target_row, Fn user_func, VisitorArgs&... args);
 
 
     /*
@@ -156,7 +227,7 @@ public:
         @param Accumulator C: distributed map that stores the partial products
     */
     template <class Matrix, class Accumulator>
-    void spgemm(Matrix &matrix_A, Accumulator &partial_accum);
+    void spGemm(Matrix &matrix_A, Accumulator &partial_accum);
 
 
 private:
@@ -164,10 +235,20 @@ private:
         contains each processor's min and max source number (row number)
     */
     std::vector<std::pair<int, int>> metadata;
+    /*
+        CSR data structure for O(1) lookup
+    */
+    std::vector<int> owner_ranks;
+    std::vector<int> row_ptrs;
+    std::vector<int> nonzero_rows;
 
+
+    int local_size = -1;
+    int local_min = -1;
+    int local_max = -1;
     ygm::comm &world;                            // store the communicator. Hence the &
-    ygm::container::array<Edge> sorted_matrix;  // store the sorted matrix
-
+    std::vector<Edge> lc_sorted_matrix;  // store the local sorted matrix
+    typename ygm::ygm_ptr<Sorted_COO> pthis;
 };
 
 
@@ -184,7 +265,9 @@ private:
         Answer:
             Assuming that & uses the caller's memory address
 
-    3. 
+    3. using "this" pointer leads to segmentation fault.
+        Theory is that the memory address contained in "this" pointer may be different from the callee's "this" pointer's memory
+        address, thus leading to segmentation fault.
     
     
     

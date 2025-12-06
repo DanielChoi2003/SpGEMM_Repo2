@@ -4,44 +4,60 @@ using std::vector;
 /*
     Member functions defined inside the class body are implicitly inline.
 */
-inline vector<int> Sorted_COO::getOwners(int source){
-    // binary search
+inline vector<int> Sorted_COO::get_owners(int source){
+
     vector<int> owners;
-    // finds the position of the first occurrence not less than (either equal or greater) the given value
-    auto it = std::lower_bound(metadata.begin(), metadata.end(), source, 
-                            [](const std::pair<int, int> min_max, int src){
-                                return min_max.second < src;
-                            });
-
-    while(it != metadata.end() && (it->first <= source && it->second >= source)){ 
-        int owner_rank = it - metadata.begin();
-        owners.push_back(owner_rank);
-        it++;
+    // if the target row number is out of bound, return empty
+    if(source < 0 || source > row_ptrs.size() - 2){
+        return owners; 
     }
-
+    int start = row_ptrs[source]; 
+    int end = row_ptrs[source+1]; // exclusive
+    while(start < end){
+        owners.push_back(owner_ranks.at(start));
+        start++;
+    }
     return owners;
 }
 
-
-inline void Sorted_COO::async_visit_row(int input_column, int input_row, int input_value, ygm::container::map<map_index, int> &matrix_C){
+template<typename Fn, typename... VisitorArgs>
+inline void Sorted_COO::async_visit_row(
+                        int target_row, 
+                        Fn user_func, 
+                        VisitorArgs&... args){
+        // NOTE: CAPTURING THE DISTRIBUTED CONTAINER BY REFERENCE MAY LEAD TO UNDEFINED BEHAVIOR 
+        //     because the distributed container may not be in the same memory address from the remote rank (callee)'s 
+        //     memory layout
+    auto vlambda = 
+        [user_func](const VisitorArgs... args) mutable { // lambda are const by default; args are read-only
+            std::invoke(user_func, args...);
+        };
     
-    /*
-        NOTE: CAPTURING THE DISTRIBUTED CONTAINER BY REFERENCE MAY LEAD TO UNDEFINED BEHAVIOR 
-            because the distributed container may not be in the same memory address from the remote rank (callee)'s 
-            memory layout
-    */
-   
-    auto multiplier = [this, &matrix_C](int input_value, int input_row, int input_column){
+    vector<int> owners = get_owners(target_row);
+    for(int owner_rank : owners){
+        //printf("Row %d is owned by rank %d\n", target_row, owner_rank);
+        assert(owner_rank >= 0 && owner_rank < world.size());
+        world.async(owner_rank, vlambda, args...);
+    }
+    
+    //DO NOT CALL BARRIER HERE. PROCESSOR NEEDS TO BE ABLE TO RUN MULTIPLE TIMES.
+}
+
+
+// input_value, input_row, input_column, pmap
+
+template <class Matrix, class Accumulator>
+inline void Sorted_COO::spGemm(Matrix &unsorted_matrix, Accumulator &partial_accum){
+
+    auto multiplier = [](auto self, auto pmap, int input_value, int input_row, int input_column){
          // find the first Edge with matching row to input_column with std::lower_bound
-        int low = sorted_matrix.partitioner.local_start();
-        int local_size  = sorted_matrix.local_size();
-        int high = low + local_size;
+        int low = 0;
+        int high = self->local_size;
         int upper_bound = high;
 
         while (low < high) {
             int mid = low + (high - low) / 2;
-            Edge mid_edge;
-            sorted_matrix.local_visit(mid, [&](int index, Edge& ed){ mid_edge = ed; });
+            const Edge &mid_edge = self->lc_sorted_matrix[mid];
 
             if (mid_edge.row < input_column) { // the edge with matching row has to be to the right of mid
                 low = mid + 1;
@@ -53,54 +69,59 @@ inline void Sorted_COO::async_visit_row(int input_column, int input_row, int inp
 
         // keep multiplying with the next Edge until the row number no longer matches
         for(int i = low; i < upper_bound; i++){
-            Edge match_edge;  
-            sorted_matrix.local_visit(i, [&](int index, Edge& ed){ match_edge = ed; });
+            const Edge &match_edge = self->lc_sorted_matrix.at(i);  
             if(match_edge.row != input_column){
                 break;
             }
 
-            int partial_product = input_value * match_edge.value; // valueB * valueA;
-            
-            // if(input_row == 5){
-            //     world.cout("Inserting position row ", input_row, ", column ", match_edge.col, " with value ", partial_product);
-            // }   
-            matrix_C.async_insert({input_row, match_edge.col}, 0);
-            auto adder = [](std::pair<int, int> coord, int &partial_product, int value_add){
+            // NOTE: could potentially overflow with large values
+            int product = input_value * match_edge.value; // valueB * valueA;
+            if(product == 0){
+                continue;
+            }
+            auto adder = [](const std::pair<int, int> &coord, int &partial_product, int value_add){
                 partial_product += value_add;
             };
-            matrix_C.async_visit(std::make_pair(input_row, match_edge.col), adder, partial_product); // Boost's hasher complains if I use a struct
+            pmap->async_visit({input_row, match_edge.col}, adder, product); // Boost's hasher complains if I use a struct
         }
     }; 
-    
-
-    vector<int> owners = getOwners(input_column);
-    for(int owner_rank : owners){
-        // if(owner_rank == 0 && input_column == 1){
-        //     world.cout("calling with row ", input_row, " and col ", input_column);
-        // }
-        world.async(owner_rank, multiplier, input_value, input_row, input_column); // async_visit_if_contains does not work??
-    }
-    
-    //DO NOT CALL BARRIER HERE. PROCESSOR NEEDS TO BE ABLE TO RUN MULTIPLE TIMES.
-}
-
-template <class Matrix, class Accumulator>
-inline void Sorted_COO::spgemm(Matrix &unsorted_matrix, Accumulator &partial_accum){
-
+    ygm::ygm_ptr<Accumulator> pmap(&partial_accum);
     unsorted_matrix.local_for_all([&](int index, Edge &ed){
         int input_column = ed.col;
         int input_row = ed.row;
         int input_value = ed.value;
-        //world.cout("Input column: ", input_column, ", input row: ", input_row, ", input_value: ", input_value);
-        async_visit_row(input_column, input_row, input_value, partial_accum);
+        async_visit_row(input_column, multiplier, pthis, pmap, input_value, input_row, input_column);
     });
 }
 
-inline void Sorted_COO::printMetadata(){
+inline void Sorted_COO::print_metadata(){
     for(int i = 0; i < metadata.size(); i++){
         world.cout("rank ", i, ": local min " , metadata.at(i).first, ", local max ", metadata.at(i).second);
     }
 }
+
+inline void Sorted_COO::print_row_owners(){
+    for(int i = 0; i < row_ptrs.size() - 1; i++){
+        int start = row_ptrs[i]; 
+        int end = row_ptrs[i+1];
+        if(start == end){
+            continue;
+        }
+        printf("row %d is owned by rank ", i);
+
+        while(start < end){
+            int owner_rank = owner_ranks.at(start);
+            if(start + 1 == end){
+                printf("%d\n", owner_rank);
+            }
+            else{
+                printf("%d, ", owner_rank);
+            }
+            start++;
+        }
+    }
+}
+
 
 
 
